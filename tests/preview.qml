@@ -98,6 +98,11 @@ ShellRoot {
         "panel.unpriced": "%1 without a published price",
         "panel.wide": "Wide",
         "panel.compact": "Compact",
+        "panel.hint": "1D/7D/30D switch · ↑↓ pick · ↵ open · b back · c copy · r refresh",
+        "panel.hint.agent": "↓ ↑ pick a model · b back · c copy · r refresh",
+        "panel.noData": "No usage recorded yet",
+        "panel.noDataHint": "Once an agent writes a session, its tokens appear here on the next refresh.",
+        "panel.unpricedHint": "Their tokens are counted; cost is shown as $0.",
       }
       return map[key] !== undefined ? map[key] : (fallback !== undefined ? fallback : key)
     }
@@ -189,7 +194,23 @@ ShellRoot {
     onTriggered: frame.grabToImage(function (result) {
       result.saveToFile("/tmp/preview.png")
       console.log("PREVIEW wide", dashboard.height)
-      Qt.quit()
+      // What a fresh install shows before any agent has written a line.
+      shell.payload = null
+      shell.wide = false
+      // Range chips and the day picker have nothing to offer with no data.
+      shell.customKind = ""
+      shell.customValue = ""
     })
+  }
+  Timer {
+    interval: 5200
+    running: true
+    onTriggered: {
+      frame.grabToImage(function (result) {
+        result.saveToFile("/tmp/preview-empty.png")
+        console.log("PREVIEW empty", dashboard.height)
+        Qt.quit()
+      })
+    }
   }
 }

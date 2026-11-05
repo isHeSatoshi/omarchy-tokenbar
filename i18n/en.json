@@ -39,7 +39,6 @@
   "panel.custom.day": "Day",
   "panel.custom.month": "Month",
   "panel.custom.clear": "Clear",
-  "panel.custom.none": "Any",
   "panel.agent.costPerMillion": "per 1M tokens",
   "panel.agent.cacheHit": "cache hit",
   "panel.agent.perDay": "per active day",
@@ -51,18 +50,9 @@
     "one": "%1 session",
     "other": "%1 sessions"
   },
-  "panel.agent.prompts": "prompts",
   "panel.agent.topModels": "Models",
   "panel.hint": "1D/7D/30D switch · ↑↓ pick · ↵ open · b back · c copy · r refresh",
   "panel.hint.agent": "↓ ↑ pick a model · b back · c copy · r refresh",
-  "panel.week": "week",
-  "panel.month": "month",
-  "agent.factory": "Droid",
-  "agent.agy": "Antigravity",
-  "agent.claude": "Claude Code",
-  "agent.codex": "Codex",
-  "agent.opencode": "OpenCode",
-  "agent.gemini": "Gemini CLI",
   "panel.wide": "Wide",
   "panel.compact": "Compact"
 }

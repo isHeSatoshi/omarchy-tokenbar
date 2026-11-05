@@ -174,7 +174,9 @@ Item {
         Column {
           id: heroLeft
           spacing: Style.space(1)
-          width: Math.max(Style.space(120), parent.width - heroRight.width - Style.space(12))
+          width: heroRight.visible
+            ? Math.max(Style.space(120), parent.width - heroRight.width - Style.space(12))
+            : parent.width
 
           Text {
             textFormat: Text.PlainText
@@ -203,6 +205,9 @@ Item {
           anchors.right: parent.right
           anchors.top: parent.top
           spacing: Style.space(2)
+          // A machine that has never scanned anything has no counts to show;
+          // the empty-state line under the chart explains what to expect.
+          visible: root.payload !== null
 
           Text {
             textFormat: Text.PlainText
@@ -323,6 +328,10 @@ Item {
 
         Chart {
           width: parent.width
+          // A flat row of zero bars is not information; the empty-state line
+          // below says the same thing in one sentence.
+          visible: (root.host ? root.host.chart.length : 0) > 1
+            && (root.summary.tokens > 0 || root.summary.prompts > 0)
           points: root.host ? root.host.chart : []
           bucket: root.host ? root.host.bucket : "day"
           foreground: root.foreground
@@ -340,10 +349,18 @@ Item {
           textFormat: Text.PlainText
           width: parent.width
           visible: root.summary.tokens === 0
-          text: root.tr("panel.emptyRange", "Nothing recorded in this range")
+          // No payload at all is a different story from a range that happens
+          // to be empty: one is "not scanned yet", the other is "all quiet".
+          text: root.payload
+            ? root.tr("panel.emptyRange", "Nothing recorded in this range")
+            : root.tr("panel.noData", "No usage recorded yet") + "\n"
+              + root.tr("panel.noDataHint",
+                  "Once an agent writes a session, its tokens appear here on the next refresh.")
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
+          lineHeight: 1.25
+          wrapMode: Text.WordWrap
         }
 
         // Wide mode puts the models beside the agents; narrow stacks them.
@@ -625,10 +642,13 @@ Item {
             ? root.tr("panel.unpriced", "%1 without a published price")
                 .arg(root.payload.unpriced.length)
               + "  ·  " + root.payload.unpriced.slice(0, 3).map(function (entry) { return entry.n }).join(", ")
+              + "\n" + root.tr("panel.unpricedHint",
+                  "Their tokens are counted; cost is shown as $0.")
             : ""
           color: root.faint
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+          lineHeight: 1.25
           wrapMode: Text.WordWrap
         }
       }
@@ -960,17 +980,21 @@ Item {
           }
         }
 
+        // The panel answers to the keyboard; say so where there is room.
         Text {
           textFormat: Text.PlainText
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
+          visible: root.wide
+          width: Math.min(implicitWidth, column.width - footerRow.width - Style.space(48))
+          horizontalAlignment: Text.AlignRight
+          elide: Text.ElideLeft
           text: root.view === "home"
             ? root.tr("panel.hint", "")
             : root.tr("panel.hint.agent", "")
           color: root.faint
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          visible: false
         }
       }
     }

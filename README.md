@@ -89,6 +89,9 @@ the right button forces a rescan.
 - **Copy summary** puts a plain-text digest on the clipboard; **Save card**
   writes a 2400×1350 share image to `~/Pictures/Tokenbar`.
 
+Before any agent has written a session, the panel says so instead of drawing an
+empty chart, and the bar reads `—` rather than a misleading `$0.00`.
+
 Keys while the panel is open: `1`/`7`/`3` pick a range, `↑`/`↓` move, `Enter`
 opens an agent, `b` goes back, `r` rescans, `c` copies the summary, `Esc`
 closes.
