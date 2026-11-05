@@ -137,7 +137,7 @@ want the state gone.
 
 ```bash
 cd ~/.config/omarchy/plugins/io.github.ishesatoshi.tokenbar
-python3 -m unittest discover -s tests -q   # scanner, 16 cases
+python3 -m unittest discover -s tests -q   # scanner, 17 cases
 node tests/model.test.mjs                  # range maths and formatting, 15 cases
 python3 tests/make-demo.py                 # deterministic synthetic payload
 ```

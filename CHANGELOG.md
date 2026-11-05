@@ -14,10 +14,11 @@ First release.
   cost per million tokens, cache hit rate, cost per active day, sessions,
   prompts, its own chart, and per-model rows.
 - Per-model breakdown, including a full list and unpriced-model reporting.
-- Wide two-column layout for the panel.
+- Wide two-column layout for the panel, with the keyboard hints in the footer.
 - Copy a plain-text summary, or save a 2400x1350 share card.
 - Incremental scanner: byte offsets per log file, so an unchanged refresh is a
   few `stat` calls. Cold scan ~100 ms, warm scan ~48 ms on 25 files.
 - Sources: Droid, Antigravity, Claude Code, Codex, OpenCode, Gemini CLI, and
   Omarchy's own agent usage records as a fallback.
+- Sessions are counted once, even when a session spans midnight.
 - English catalog with plural forms; other languages get one file at a time.
