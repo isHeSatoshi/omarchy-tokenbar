@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ishesatoshi.tokenbar",
+  "name": "Tokenbar",
+  "version": "1.0.0",
+  "author": "ishesatoshi",
+  "license": "MIT",
+  "description": "Token usage and estimated cost for every coding agent on the machine, read straight from their local logs. The bar shows today's spend; the panel has a full dashboard with ranges, charts, per-agent and per-model detail.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tokenbar",
+    "description": "Today's AI token usage and estimated cost, with a dashboard for every agent, model, and day.",
+    "category": "AI",
+    "aliases": [
+      "tokenbar",
+      "tokens",
+      "cost",
+      "spend",
+      "usage"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "display": "cost",
+      "range": "today",
+      "refreshSec": 120,
+      "showIcon": true
+    },
+    "schema": [
+      {
+        "key": "display",
+        "type": "enum",
+        "label": "Bar readout",
+        "options": [
+          "cost",
+          "tokens",
+          "both"
+        ],
+        "defaultValue": "cost",
+        "description": "What the bar shows: estimated spend, token count, or both."
+      },
+      {
+        "key": "range",
+        "type": "enum",
+        "label": "Bar range",
+        "options": [
+          "today",
+          "7d",
+          "30d"
+        ],
+        "defaultValue": "today",
+        "description": "Which window the bar readout covers."
+      },
+      {
+        "key": "refreshSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 120,
+        "description": "How often the scanner reads the logs. It only reads what was appended since the last run."
+      },
+      {
+        "key": "showIcon",
+        "type": "boolean",
+        "label": "Show icon",
+        "defaultValue": true,
+        "description": "Draw the chart glyph beside the value."
+      }
+    ]
+  }
+}

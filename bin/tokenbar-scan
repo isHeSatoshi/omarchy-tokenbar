@@ -1,0 +1,1089 @@
+#!/usr/bin/env python3
+"""Tokenbar scan: local token usage and estimated cost for every coding agent.
+
+Reads the logs the agents already keep, incrementally: a file that grew since
+the last run is read from where it stopped, a file that was replaced is read
+again. The result is one small JSON payload the Omarchy bar widget and panel
+draw; nothing here talks to the network.
+
+Usage:
+  tokenbar-scan                 refresh the cache and print the payload
+  tokenbar-scan --json          the same, explicitly
+  tokenbar-scan --refresh       ignore the per-file offsets and rescan
+  tokenbar-scan --doctor        print what each source found and why
+  tokenbar-scan --path          print the cache path
+  tokenbar-scan --days 90       keep only 90 days of history
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+SCHEMA = 4
+DEFAULT_HISTORY_DAYS = 365
+MAX_LINE_BYTES = 8 * 1024 * 1024
+# A single refresh never reads more than this from one file. The rest waits
+# for the next run, so a huge first scan cannot stall the shell.
+MAX_READ_BYTES = 256 * 1024 * 1024
+
+HOME = Path(os.path.expanduser("~"))
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
+CACHE_DIR = CACHE_HOME / "omarchy" / "tokenbar"
+CACHE_FILE = CACHE_DIR / "usage.json"
+STATE_FILE = CACHE_DIR / "scan-state.json"
+LOCK_FILE = CACHE_DIR / "scan.lock"
+
+
+# --------------------------------------------------------------------------
+# prices
+#
+# Published list prices in US dollars per million tokens, as
+# (input, output, cache read, cache write). Cache write is None when the
+# provider bills no separate write, which reads as free; Anthropic is the
+# one family here that charges for it.
+# A family rule matches the start of the normalised model id; the first one
+# that matches wins, so more specific families come first. This is an
+# estimate: subscriptions do not charge per token, and the panel says so.
+# --------------------------------------------------------------------------
+
+PRICES: list[tuple[str, tuple[float, float, float | None, float | None]]] = [
+    (r"^claude-opus-5-5", (4.0, 20.0, 0.2, 5.0)),
+    (r"^claude-opus-5", (5.0, 25.0, 0.5, 6.25)),
+    (r"^claude-opus-4-[5-9]", (5.0, 25.0, 0.5, 6.25)),
+    (r"^claude-opus-4", (15.0, 75.0, 1.5, 18.75)),
+    (r"^claude-sonnet-5-5", (2.0, 10.0, 0.1, 2.5)),
+    (r"^claude-sonnet-5", (2.0, 10.0, 0.2, 2.5)),
+    (r"^claude-sonnet-4", (3.0, 15.0, 0.3, 3.75)),
+    (r"^claude-haiku-5", (0.1, 0.5, 0.01, 0.125)),
+    (r"^claude-haiku-4", (1.0, 5.0, 0.1, 1.25)),
+    (r"^gpt-6\.1-sol", (2.0, 10.0, 0.1, 2.5)),
+    (r"^gpt-6\.1-terra", (1.0, 5.0, 0.05, 1.25)),
+    (r"^gpt-6-astra", (10.0, 50.0, 1.0, 12.5)),
+    (r"^gpt-6-luna", (0.1, 0.5, 0.01, 0.125)),
+    (r"^gpt-6-rosalind", (15.0, 75.0, 1.5, 18.75)),
+    (r"^gpt-6-sol", (2.0, 10.0, 0.2, 2.5)),
+    (r"^gpt-5\.4-pro", (30.0, 180.0, None, None)),
+    (r"^gpt-5\.4-mini", (0.75, 4.5, 0.075, None)),
+    (r"^gpt-5\.4-nano", (0.2, 1.25, 0.02, None)),
+    (r"^gpt-5\.4", (2.5, 15.0, 0.25, None)),
+    (r"^gpt-5-codex", (1.25, 10.0, 0.125, None)),
+    (r"^gpt-5-mini", (0.25, 2.0, 0.025, None)),
+    (r"^gpt-5-nano", (0.05, 0.4, 0.005, None)),
+    (r"^gpt-5", (1.25, 10.0, 0.125, None)),
+    (r"^o3-pro", (20.0, 80.0, None, None)),
+    (r"^o3-mini", (1.1, 4.4, 0.55, None)),
+    (r"^o3", (2.0, 8.0, 0.5, None)),
+    (r"^o4-mini", (1.1, 4.4, 0.275, None)),
+    (r"^deepseek-v4-pro", (1.32, 3.96, 0.044, 0.0)),
+    (r"^deepseek-v4", (0.3, 1.2, 0.006, 0.0)),
+    (r"^deepseek", (0.28, 0.42, 0.028, 0.0)),
+    (r"^gemini-3(\.\d+)?-flash-lite", (0.25, 1.5, 0.025, None)),
+    (r"^gemini-3\.[6-9]-flash", (0.75, 3.75, 0.075, None)),
+    (r"^gemini-3\.5-flash", (1.5, 9.0, 0.15, None)),
+    (r"^gemini-3(\.\d+)?-flash", (0.5, 3.0, 0.05, None)),
+    (r"^gemini-3(\.\d+)?-pro", (2.0, 12.0, 0.2, None)),
+    (r"^gemini-2\.5-flash-lite", (0.1, 0.4, 0.01, None)),
+    (r"^gemini-2\.5-flash", (0.3, 2.5, 0.03, None)),
+    (r"^gemini-2\.5-pro", (1.25, 10.0, 0.125, None)),
+    (r"^grok-code", (0.2, 1.5, 0.02, None)),
+    (r"^grok-3-mini", (0.3, 0.5, 0.075, None)),
+    (r"^grok", (3.0, 15.0, 0.75, None)),
+    (r"^kimi-k2", (0.6, 2.5, 0.15, None)),
+    (r"^kimi", (0.55, 2.2, 0.15, None)),
+    (r"^qwen3-coder", (0.45, 1.8, None, None)),
+    (r"^qwen", (0.22, 0.88, None, None)),
+    (r"^glm", (0.6, 2.2, 0.11, None)),
+    (r"^minimax-m?3", (0.3, 1.2, 0.06, 0.3)),
+    (r"^minimax", (0.3, 1.2, 0.06, 0.3)),
+]
+
+_PRICE_CACHE: dict[str, tuple[float, float, float, float] | None] = {}
+_PRICE_RULES = [(re.compile(pattern), rates) for pattern, rates in PRICES]
+
+# Names that mean "no model was recorded". They are counted, never priced,
+# and never listed among the unpriced models.
+UNKNOWN_MODELS = {"", "unknown", "none", "default", "synthetic", "n/a"}
+
+
+def normalize_model(name: Any) -> str:
+    """A model id folded to the spelling the price table matches on."""
+    text = str(name or "").strip().lower()
+    if not text:
+        return ""
+    # Provider prefixes ("fireworks/accounts/.../deepseek-v4") carry no price
+    # information; the last segment does.
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    text = text.split(":")[0]
+    # A picker label ("Gemini 3.8 Flash (High)") folds to the same id shape a
+    # transcript would record.
+    text = re.sub(r"[()]", " ", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    # A trailing build or date stamp ("-1017", "-20260205") is not a model.
+    text = re.sub(r"-(?:20\d{6}|\d{4,})$", "", text)
+    text = re.sub(r"@.*$", "", text)
+    return re.sub(r"-+", "-", text).strip("-")
+
+
+def price_for(model: str) -> tuple[float, float, float, float] | None:
+    """(input, output, cache read, cache write) dollars per million, or None."""
+    key = normalize_model(model)
+    if key in _PRICE_CACHE:
+        return _PRICE_CACHE[key]
+    found = None
+    if key not in UNKNOWN_MODELS:
+        for pattern, rates in _PRICE_RULES:
+            if pattern.search(key):
+                found = (
+                    rates[0],
+                    rates[1],
+                    rates[2] if rates[2] is not None else 0.0,
+                    rates[3] if rates[3] is not None else 0.0,
+                )
+                break
+    _PRICE_CACHE[key] = found
+    return found
+
+
+def row_cost_nano(model: str, input_tokens: int, output_tokens: int, cache_read: int, cache_write: int) -> int:
+    """Estimated cost of one row in billionths of a dollar."""
+    rates = price_for(model)
+    if rates is None:
+        return 0
+    dollars = (
+        input_tokens * rates[0]
+        + output_tokens * rates[1]
+        + cache_read * rates[2]
+        + cache_write * rates[3]
+    ) / 1_000_000.0
+    return int(round(dollars * 1_000_000_000))
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+
+def local_day(value: Any) -> str | None:
+    """The local calendar day of an ISO stamp, epoch seconds, or epoch ms."""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+            stamp = float(value)
+            if stamp <= 0:
+                return None
+            moment = dt.datetime.fromtimestamp(stamp / 1000.0 if stamp > 1e11 else stamp, dt.timezone.utc)
+        else:
+            text = str(value).strip().replace("Z", "+00:00")
+            moment = dt.datetime.fromisoformat(text)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=dt.timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    try:
+        day = moment.astimezone().date()
+    except (ValueError, OverflowError, OSError):
+        return None
+    return day.isoformat() if 2000 <= day.year <= 2100 else None
+
+
+def number(value: Any) -> int:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return int(n) if n > 0 and n != float("inf") else 0
+
+
+_NUMBER_PATTERNS: dict[str, re.Pattern[str]] = {}
+
+
+def num_match(line: str, field: str) -> int:
+    """The integer value of `"field":123` in a raw JSON line.
+
+    A line can be megabytes of reasoning text, so the scan reads the handful
+    of numbers it needs instead of building the document.
+    """
+    pattern = _NUMBER_PATTERNS.get(field)
+    if pattern is None:
+        pattern = re.compile(r'"' + re.escape(field) + r'":\s*(\d{1,18})')
+        _NUMBER_PATTERNS[field] = pattern
+    match = pattern.search(line)
+    return int(match.group(1)) if match else 0
+
+
+def first_match(line: str, pattern: str) -> str:
+    match = re.search(pattern, line)
+    return match.group(1) if match else ""
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path: Path, payload: Any) -> None:
+    """Write atomically: a reader never sees half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"), sort_keys=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def file_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+# --------------------------------------------------------------------------
+# incremental reading
+#
+# Each source file keeps an offset and the rows it already produced. A file
+# that only grew is read from its offset; one that shrank, was replaced, or
+# is new is read from the start. Rows are stored per file so a vanished file
+# (a rotated log, a deleted session) takes its rows with it.
+# --------------------------------------------------------------------------
+
+
+class FileState:
+    __slots__ = ("ino", "offset", "usage", "act", "carry", "cached")
+
+    def __init__(self, raw: dict | None = None):
+        raw = raw or {}
+        self.ino = int(raw.get("ino") or 0)
+        self.offset = int(raw.get("offset") or 0)
+        self.usage: dict[str, dict[str, dict[str, list[int]]]] = raw.get("usage") or {}
+        self.act: dict[str, dict[str, dict[str, Any]]] = raw.get("act") or {}
+        self.carry: dict[str, Any] = raw.get("carry") or {}
+        self.cached = bool(raw.get("cached"))
+
+    def to_json(self) -> dict:
+        return {
+            "ino": self.ino,
+            "offset": self.offset,
+            "usage": self.usage,
+            "act": self.act,
+            "carry": self.carry,
+            "cached": self.cached,
+        }
+
+    def reset(self) -> None:
+        self.offset = 0
+        self.usage = {}
+        self.act = {}
+        self.carry = {}
+        self.cached = False
+
+    def add_tokens(self, day: str, agent: str, model: str, input_tokens: int, output_tokens: int,
+                   cache_read: int, cache_write: int) -> None:
+        if not (input_tokens or output_tokens or cache_read or cache_write):
+            return
+        bucket = self.usage.setdefault(day, {}).setdefault(agent, {})
+        row = bucket.setdefault(model, [0, 0, 0, 0])
+        row[0] += input_tokens
+        row[1] += output_tokens
+        row[2] += cache_read
+        row[3] += cache_write
+
+    def add_activity(self, day: str, agent: str, session: str, prompts: int = 0) -> None:
+        slot = self.act.setdefault(day, {}).setdefault(agent, {"sessions": [], "prompts": 0})
+        if session and session not in slot["sessions"]:
+            slot["sessions"].append(session)
+        slot["prompts"] += prompts
+
+
+def read_appended(path: Path, state: FileState, force: bool, on_line) -> int:
+    """Feed the bytes after the state's offset to `on_line`; whole lines only.
+
+    Returns the number of bytes consumed. A partial last line stays unread:
+    the writer has not finished it, and the next run picks it up.
+    """
+    signature = file_signature(path)
+    if signature is None:
+        state.reset()
+        return 0
+    ino, size, _mtime = signature
+    if force or state.ino != ino or size < state.offset:
+        state.reset()
+    state.ino = ino
+    if size == state.offset:
+        return 0
+
+    remaining = size - state.offset
+    limit = min(remaining, MAX_READ_BYTES)
+    consumed = 0
+    pending = b""
+    with open(path, "rb") as handle:
+        handle.seek(state.offset)
+        while consumed < limit:
+            chunk = handle.read(min(4 * 1024 * 1024, limit - consumed))
+            if not chunk:
+                break
+            consumed += len(chunk)
+            start = 0
+            while True:
+                newline = chunk.find(b"\n", start)
+                if newline < 0:
+                    break
+                raw = (pending + chunk[start:newline]) if pending else chunk[start:newline]
+                pending = b""
+                start = newline + 1
+                if raw and len(raw) <= MAX_LINE_BYTES:
+                    try:
+                        on_line(raw.decode("utf-8", "replace"))
+                    except Exception:  # a bad line never stops a scan
+                        pass
+            if start < len(chunk):
+                pending += chunk[start:]
+                # A line that never ends is dropped rather than held forever.
+                if len(pending) > MAX_LINE_BYTES:
+                    pending = b""
+    # Unconsumed bytes belong to a line that is not finished yet.
+    state.offset += consumed - len(pending)
+    return consumed
+
+
+# --------------------------------------------------------------------------
+# sources
+#
+# A source is (id, agent name, session root, scan function). The scan
+# functions receive a FileState and fill it; they never write the payload.
+# --------------------------------------------------------------------------
+
+
+class SourceLog:
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []
+
+    def add(self, source: str, ok: bool, files: int = 0, rows: int = 0, note: str = "") -> None:
+        self.entries.append({"id": source, "ok": ok, "files": files, "rows": rows, "note": note})
+
+
+def scan_factory(state_files: dict[str, FileState], force: bool, log: SourceLog) -> None:
+    """Droid: per-call usage from the droid log, prompts from the sessions."""
+    log_dir = HOME / ".factory" / "logs"
+    pattern = re.compile(r"^\[([^\]]+)\].*?\[Agent\] Streaming result \| Context: (\{.*)$")
+    files = sorted(str(p) for p in log_dir.glob("droid-log-single.log*") if p.is_file())
+
+    rows = 0
+    for path_text in files:
+        path = Path(path_text)
+        state = state_files.setdefault(path_text, FileState())
+        before = sum(len(models) for day in state.usage.values() for models in day.values())
+
+        def on_line(line: str, path_text=path_text) -> None:
+            nonlocal rows
+            if "Streaming result" not in line:
+                return
+            match = pattern.match(line)
+            if not match:
+                return
+            try:
+                payload = json.loads(match.group(2))
+            except ValueError:
+                return
+            tags = payload.get("tags") or {}
+            day = local_day(match.group(1))
+            if not day:
+                return
+            session = str(tags.get("sessionId") or "")
+            model = normalize_model(tags.get("modelId"))
+            if not model:
+                model = "unknown"
+            state_files[path_text].add_tokens(
+                day, "factory", model,
+                number(payload.get("inputTokens")),
+                number(payload.get("outputTokens")),
+                number(payload.get("cacheReadInputTokens")),
+                number(payload.get("cachedTokensWritten")),
+            )
+            state_files[path_text].add_activity(day, "factory", session)
+            rows += 1
+
+        read_appended(path, state, force, on_line)
+        after = sum(len(models) for day in state.usage.values() for models in day.values())
+        if after == before and force:
+            state.cached = False
+
+    # Prompts: one typed user message is one prompt. Empty user messages are
+    # tool results, and system reminders are the harness talking to itself.
+    prompt_files = sorted(str(p) for p in (HOME / ".factory" / "sessions").glob("*/*.jsonl") if p.is_file())
+    prompts = 0
+    for path_text in prompt_files:
+        path = Path(path_text)
+        state = state_files.setdefault(path_text, FileState())
+        session = path.stem
+
+        def on_prompt(line: str, path_text=path_text, session=session) -> None:
+            nonlocal prompts
+            head = line[:600]
+            if '"message"' not in head or '"user"' not in head:
+                return
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                return
+            if entry.get("type") != "message":
+                return
+            message = entry.get("message") or {}
+            if message.get("role") != "user":
+                return
+            content = message.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            else:
+                text = ""
+            text = text.strip()
+            if not text or text.startswith("<system-reminder>"):
+                return
+            day = local_day(entry.get("timestamp"))
+            if not day:
+                return
+            state_files[path_text].add_activity(day, "factory", session, 1)
+            prompts += 1
+
+        read_appended(path, state, force, on_prompt)
+
+    log.add("factory", bool(files), len(files) + len(prompt_files), rows, "" if files else "no droid log")
+
+
+def scan_agy(state_files: dict[str, FileState], force: bool, log: SourceLog) -> None:
+    """Antigravity: per-step tokens from the conversation transcripts."""
+    root = Path(os.environ.get("AGY_DIR") or (HOME / ".gemini" / "antigravity-cli"))
+    files = sorted(str(p) for p in (root / "brain").glob("*/.system_generated/logs/transcript.jsonl") if p.is_file())
+    model_selection = re.compile(r"Model Selection` (?:from .+? )?to (.+?)\.(?:\s|$|<)")
+    rows = 0
+
+    for path_text in files:
+        path = Path(path_text)
+        state = state_files.setdefault(path_text, FileState())
+        session = path.parent.parent.parent.name
+
+        def on_line(line: str, path_text=path_text, session=session) -> None:
+            nonlocal rows
+            carries_tokens = '"input_tokens"' in line or '"output_tokens"' in line
+            carries_model = "Model Selection" in line
+            if not carries_tokens and not carries_model:
+                return
+            state = state_files[path_text]
+            # Transcript lines carry whole reasoning blocks, so the handful of
+            # fields this needs are read without building the document.
+            if carries_model:
+                try:
+                    step = json.loads(line)
+                except ValueError:
+                    step = None
+                content = step.get("content") if isinstance(step, dict) else None
+                if isinstance(content, str):
+                    match = model_selection.search(content)
+                    if match:
+                        state.carry["model"] = normalize_model(re.sub(r"[()]", " ", match.group(1)))
+            if not carries_tokens:
+                return
+            day = local_day(first_match(line, r'"(?:created_at|timestamp)":\s*"([^"]+)"'))
+            if not day:
+                return
+            usage = {
+                "input_tokens": num_match(line, "input_tokens"),
+                "output_tokens": num_match(line, "output_tokens"),
+                "cache_read_tokens": num_match(line, "cache_read_tokens"),
+                "cache_write_tokens": num_match(line, "cache_write_tokens"),
+            }
+            if '"prompt_token_count"' in line or '"candidates_token_count"' in line:
+                prompt = num_match(line, "prompt_token_count")
+                cached = min(prompt, num_match(line, "cached_content_token_count"))
+                input_tokens = prompt - cached
+                output_tokens = num_match(line, "candidates_token_count") + num_match(line, "thoughts_token_count")
+                cache_read = cached
+                cache_write = 0
+            else:
+                input_tokens = usage["input_tokens"]
+                output_tokens = usage["output_tokens"]
+                cache_read = usage["cache_read_tokens"]
+                cache_write = usage["cache_write_tokens"]
+            if not (input_tokens or output_tokens or cache_read or cache_write):
+                return
+            state.add_tokens(day, "agy", state.carry.get("model") or "unknown",
+                             input_tokens, output_tokens, cache_read, cache_write)
+            rows += 1
+
+        read_appended(path, state, force, on_line)
+
+    # Prompts come from history.jsonl, one line per typed message.
+    history = root / "history.jsonl"
+    prompts = 0
+    if history.is_file():
+        history_text = str(history)
+        state = state_files.setdefault(history_text, FileState())
+
+        def on_history(line: str) -> None:
+            nonlocal prompts
+            if '"timestamp"' not in line:
+                return
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                return
+            day = local_day(entry.get("timestamp"))
+            if not day:
+                return
+            conversation = str(entry.get("conversationId") or entry.get("conversation_id") or "")
+            state_files[history_text].add_activity(day, "agy", conversation, 1)
+            prompts += 1
+
+        read_appended(history, state, force, on_history)
+
+    log.add("agy", bool(files), len(files) + (1 if history.is_file() else 0), rows,
+            "" if files else "no antigravity transcripts")
+
+
+def scan_claude(state_files: dict[str, FileState], force: bool, log: SourceLog) -> None:
+    """Claude Code: each assistant reply's usage, each typed prompt."""
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
+    files = sorted(str(p) for p in (root / "projects").glob("**/*.jsonl") if p.is_file())
+    rows = 0
+
+    for path_text in files:
+        path = Path(path_text)
+        state = state_files.setdefault(path_text, FileState())
+        session = path.stem
+
+        def on_line(line: str, path_text=path_text, session=session) -> None:
+            nonlocal rows
+            state = state_files[path_text]
+            head = line[:600]
+            if '"usage"' in line and '"assistant"' in head:
+                if '"type"' not in head:
+                    return
+                # A transcript line carries the whole reply; the usage numbers
+                # are read from the raw line rather than rebuilding it.
+                key = hashlib.blake2b(line.encode("utf-8", "replace"), digest_size=8).hexdigest()
+                seen = state.carry.setdefault("ids", [])
+                if key in seen:
+                    return
+                seen.append(key)
+                if len(seen) > 4000:
+                    del seen[:2000]
+                day = local_day(first_match(line, r'"timestamp":\s*"([^"]+)"'))
+                if not day:
+                    return
+                model = normalize_model(first_match(line, r'"model":\s*"([^"]+)"'))
+                state.add_tokens(
+                    day, "claude", model or "unknown",
+                    num_match(line, "input_tokens"),
+                    num_match(line, "output_tokens"),
+                    num_match(line, "cache_read_input_tokens"),
+                    num_match(line, "cache_creation_input_tokens"),
+                )
+                state.add_activity(day, "claude", session)
+                rows += 1
+            elif '"user"' in head and '"message"' in head:
+                if '"tool_result"' in line:
+                    return
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    return
+                if entry.get("type") != "user":
+                    return
+                message = entry.get("message") or {}
+                content = message.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+                else:
+                    return
+                text = text.strip()
+                if not text or text.startswith("<") or text.startswith("Caveat:"):
+                    return
+                day = local_day(entry.get("timestamp"))
+                if day:
+                    state.add_activity(day, "claude", session, 1)
+
+        read_appended(path, state, force, on_line)
+
+    log.add("claude", bool(files), len(files), rows, "" if files else "no Claude Code transcripts")
+
+
+def scan_codex(state_files: dict[str, FileState], force: bool, log: SourceLog) -> None:
+    """Codex: token_count events, with the model carried from turn_context."""
+    root = Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
+    files = sorted(str(p) for p in (root / "sessions").glob("**/*.jsonl") if p.is_file())
+    rows = 0
+
+    for path_text in files:
+        path = Path(path_text)
+        state = state_files.setdefault(path_text, FileState())
+        session = path.stem
+
+        def on_line(line: str, path_text=path_text, session=session) -> None:
+            nonlocal rows
+            if '"turn_context"' not in line and '"token_count"' not in line:
+                return
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                return
+            state = state_files[path_text]
+            payload = entry.get("payload") or {}
+            if entry.get("type") == "turn_context":
+                model = payload.get("model") or payload.get("model_name")
+                if isinstance(model, str) and model.strip():
+                    state.carry["model"] = normalize_model(model)
+                return
+            if not (isinstance(payload, dict) and payload.get("type") == "token_count"):
+                return
+            info = payload.get("info") or {}
+            if not isinstance(info, dict):
+                return
+            last = info.get("last_token_usage") or {}
+            if not isinstance(last, dict) or not last:
+                return
+            day = local_day(entry.get("timestamp"))
+            if not day:
+                return
+            input_tokens = number(last.get("input_tokens"))
+            cached = min(input_tokens, number(last.get("cached_input_tokens")))
+            state.add_tokens(
+                day, "codex", state.carry.get("model", "unknown"),
+                input_tokens - cached,
+                number(last.get("output_tokens")),
+                cached,
+                0,
+            )
+            state.add_activity(day, "codex", session)
+            rows += 1
+
+        read_appended(path, state, force, on_line)
+
+    log.add("codex", bool(files), len(files), rows, "" if files else "no Codex sessions")
+
+
+def scan_opencode(state_files: dict[str, FileState], force: bool, log: SourceLog) -> None:
+    """OpenCode: one row per assistant message in its SQLite store."""
+    root = Path(os.environ.get("OPENCODE_DATA") or (HOME / ".local" / "share" / "opencode"))
+    candidates = [Path(os.environ["OPENCODE_DB"])] if os.environ.get("OPENCODE_DB") else [root / "opencode.db", root / "opencode-v2.db"]
+    database = next((path for path in candidates if path.is_file()), None)
+    if database is None:
+        log.add("opencode", False, 0, 0, "no opencode database")
+        return
+
+    signature = file_signature(database)
+    key = str(database)
+    state = state_files.setdefault(key, FileState())
+    stamp = f"{signature[0]}:{signature[1]}:{signature[2]}" if signature else ""
+    if not force and state.cached and state.carry.get("stamp") == stamp:
+        log.add("opencode", True, 1, number(state.carry.get("rows")), "unchanged")
+        return
+
+    state.reset()
+    rows = 0
+    try:
+        conn = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "message" in tables:
+                cursor = conn.execute("SELECT data FROM message")
+            elif "messages" in tables:
+                cursor = conn.execute("SELECT data FROM messages")
+            else:
+                cursor = None
+            while cursor is not None:
+                record = cursor.fetchone()
+                if record is None:
+                    break
+                try:
+                    data = json.loads(record[0])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(data, dict) or data.get("role") != "assistant":
+                    continue
+                tokens = data.get("tokens") or {}
+                if not isinstance(tokens, dict):
+                    continue
+                cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+                model = data.get("modelID") or data.get("modelId") or (data.get("model") or {}).get("modelID") or "unknown"
+                day = local_day(data.get("time", {}).get("created") if isinstance(data.get("time"), dict) else data.get("created"))
+                if not day:
+                    continue
+                state.add_tokens(
+                    day, "opencode", normalize_model(model) or "unknown",
+                    number(tokens.get("input")),
+                    number(tokens.get("output")),
+                    number(cache.get("read")),
+                    number(cache.get("write")),
+                )
+                session = str(data.get("sessionID") or data.get("sessionId") or "")
+                state.add_activity(day, "opencode", session)
+                rows += 1
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        log.add("opencode", False, 1, rows, f"database error: {error}")
+        return
+
+    state.cached = True
+    state.carry = {"stamp": stamp, "rows": rows}
+    log.add("opencode", True, 1, rows, "")
+
+
+def scan_gemini(state_files: dict[str, FileState], force: bool, log: SourceLog) -> None:
+    """Gemini CLI: its per-session JSON transcripts."""
+    root = Path(os.environ.get("GEMINI_CLI_HOME") or (HOME / ".gemini"))
+    files = sorted(str(p) for p in (root / "tmp").glob("**/chats/session-*.json") if p.is_file())
+    rows = 0
+    for path_text in files:
+        path = Path(path_text)
+        signature = file_signature(path)
+        if signature is None:
+            continue
+        state = state_files.setdefault(path_text, FileState())
+        stamp = f"{signature[0]}:{signature[1]}:{signature[2]}"
+        if not force and state.cached and state.carry.get("stamp") == stamp:
+            continue
+        state.reset()
+        state.carry = {"stamp": stamp}
+        state.cached = True
+        try:
+            document = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        messages = document.get("messages") if isinstance(document, dict) else document
+        session = path.stem
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict) or message.get("type") != "gemini":
+                continue
+            tokens = message.get("tokens") or {}
+            if not isinstance(tokens, dict):
+                continue
+            day = local_day(message.get("timestamp"))
+            if not day:
+                continue
+            state.add_tokens(
+                day, "gemini", normalize_model(message.get("model")) or "unknown",
+                number(tokens.get("input")),
+                number(tokens.get("output")) + number(tokens.get("thoughts")),
+                number(tokens.get("cached")),
+                0,
+            )
+            state.add_activity(day, "gemini", session)
+            rows += 1
+    log.add("gemini", bool(files), len(files), rows, "" if files else "no Gemini CLI transcripts")
+
+
+# Agents Omarchy's own usage records know about that this scan does not read
+# natively. Their records carry a token count per recent day, so they still
+# count toward the total, without a model or a price.
+FALLBACK_AGENTS = {
+    "factory": "Droid",
+    "gemini": "Gemini CLI",
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "agy": "Antigravity",
+    "copilot": "GitHub Copilot",
+    "cursor": "Cursor",
+    "kimi": "Kimi Code",
+    "qwen": "Qwen",
+    "minimax": "MiniMax",
+    "opencode": "OpenCode",
+    "grok": "Grok",
+}
+
+
+def scan_omarchy_records(state_files: dict[str, FileState], force: bool, log: SourceLog, covered: set[str]) -> None:
+    """Omarchy's agent records, for agents this scan has no native rows for."""
+    directory = STATE_HOME / "omarchy" / "agents" / "usage"
+    if not directory.is_dir():
+        return
+    added = 0
+    for path in sorted(directory.glob("*.json")):
+        agent = path.stem
+        if agent in covered:
+            continue
+        signature = file_signature(path)
+        if signature is None:
+            continue
+        key = str(path)
+        state = state_files.setdefault(key, FileState())
+        stamp = f"{signature[0]}:{signature[1]}:{signature[2]}"
+        if not force and state.cached and state.carry.get("stamp") == stamp:
+            continue
+        state.reset()
+        state.carry = {"stamp": stamp}
+        state.cached = True
+        record = read_json(path)
+        if not isinstance(record, dict):
+            continue
+        for day_entry in record.get("recentDays") or []:
+            if not isinstance(day_entry, dict):
+                continue
+            day = str(day_entry.get("date") or "")
+            tokens = number(day_entry.get("messageCount"))
+            if not day or not tokens:
+                continue
+            state.add_tokens(day, agent, "unknown", tokens, 0, 0, 0)
+            state.add_activity(day, agent, "")
+            added += 1
+        state.carry["rows"] = added
+    log.add("omarchy", True, len(list(directory.glob("*.json"))), added, "recent days only")
+
+
+# --------------------------------------------------------------------------
+# aggregation
+# --------------------------------------------------------------------------
+
+
+def build_payload(state_files: dict[str, FileState], meta: dict[str, Any], history_days: int) -> dict[str, Any]:
+    cutoff = (dt.date.today() - dt.timedelta(days=history_days - 1)).isoformat()
+
+    # agent -> model -> [input, output, cacheRead, cacheWrite]
+    lifetime: dict[str, dict[str, list[int]]] = {}
+    days: dict[str, dict[str, dict[str, list[int]]]] = {}
+    activity: dict[str, dict[str, dict[str, Any]]] = {}
+
+    for state in state_files.values():
+        for day, agents in state.usage.items():
+            if day < cutoff:
+                continue
+            day_bucket = days.setdefault(day, {})
+            for agent, models in agents.items():
+                target = day_bucket.setdefault(agent, {})
+                lifetime_agent = lifetime.setdefault(agent, {})
+                for model, counts in models.items():
+                    row = target.setdefault(model, [0, 0, 0, 0])
+                    life = lifetime_agent.setdefault(model, [0, 0, 0, 0])
+                    for index in range(4):
+                        row[index] += counts[index]
+                        life[index] += counts[index]
+        for day, agents in state.act.items():
+            if day < cutoff:
+                continue
+            for agent, slot in agents.items():
+                entry = activity.setdefault(day, {}).setdefault(agent, {"sessions": [], "prompts": 0})
+                for session in slot.get("sessions") or []:
+                    if session and session not in entry["sessions"]:
+                        entry["sessions"].append(session)
+                entry["prompts"] += number(slot.get("prompts"))
+
+    # An agent that only recorded prompts (a session with no usage line this
+    # scan can read) still stands as an agent, with no tokens to price.
+    for day, agents in activity.items():
+        for agent in agents:
+            lifetime.setdefault(agent, {})
+
+    agent_ids = sorted(lifetime)
+    model_names = sorted({model for models in lifetime.values() for model in models if model})
+    model_index = {name: index for index, name in enumerate(model_names)}
+    agent_index = {name: index for index, name in enumerate(agent_ids)}
+
+    day_rows = []
+    for day in sorted(days):
+        rows = []
+        for agent in sorted(days[day]):
+            for model in sorted(days[day][agent]):
+                counts = days[day][agent][model]
+                if not any(counts):
+                    continue
+                rows.append([
+                    agent_index[agent],
+                    model_index.get(model, -1),
+                    counts[0], counts[1], counts[2], counts[3],
+                    row_cost_nano(model, *counts),
+                ])
+        act = []
+        for agent, slot in sorted(activity.get(day, {}).items()):
+            act.append([agent_index.get(agent, -1), len(slot.get("sessions") or []), number(slot.get("prompts"))])
+        if rows or act:
+            day_rows.append({"d": day, "r": rows, "a": act})
+
+    agents = []
+    unpriced: dict[str, int] = {}
+    for agent in agent_ids:
+        models = lifetime[agent]
+        total_input = sum(row[0] for row in models.values())
+        total_output = sum(row[1] for row in models.values())
+        total_cache_read = sum(row[2] for row in models.values())
+        total_cache_write = sum(row[3] for row in models.values())
+        cost_nano = sum(row_cost_nano(model, *row) for model, row in models.items())
+        model_rows = []
+        for model, row in sorted(models.items(), key=lambda item: item[1][0] + item[1][1] + item[1][2] + item[1][3], reverse=True):
+            model_cost = row_cost_nano(model, *row)
+            priced = price_for(model) is not None
+            if not priced and model not in UNKNOWN_MODELS:
+                unpriced[model] = unpriced.get(model, 0) + sum(row)
+            model_rows.append({
+                "n": model or "unknown",
+                "i": row[0], "o": row[1], "cr": row[2], "cw": row[3],
+                "c": model_cost,
+                "priced": priced,
+            })
+        active_days = sum(1 for day in days if agent in days[day]) + sum(
+            1 for day in activity if agent in activity[day] and agent not in days.get(day, {})
+        )
+        agent_sessions: set[str] = set()
+        prompts = 0
+        for day in activity:
+            slot = activity[day].get(agent)
+            if not slot:
+                continue
+            agent_sessions.update(slot.get("sessions") or [])
+            prompts += number(slot.get("prompts"))
+        agents.append({
+            "id": agent,
+            "name": FALLBACK_AGENTS.get(agent, agent),
+            "i": total_input, "o": total_output, "cr": total_cache_read, "cw": total_cache_write,
+            "tokens": total_input + total_output + total_cache_read + total_cache_write,
+            "cost": cost_nano,
+            "activeDays": active_days,
+            "sessions": len(agent_sessions),
+            "prompts": prompts,
+            "models": model_rows,
+        })
+
+    payload = {
+        "schemaVersion": SCHEMA,
+        "generatedAt": int(time.time() * 1000),
+        "historyDays": history_days,
+        "agents": agents,
+        "agentIds": agent_ids,
+        "modelNames": model_names,
+        "days": day_rows,
+        "unpriced": [{"n": name, "tokens": tokens} for name, tokens in sorted(unpriced.items(), key=lambda item: -item[1])],
+        "meta": meta,
+    }
+    return payload
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+
+def scan(force: bool, history_days: int) -> dict[str, Any]:
+    started = time.perf_counter()
+    previous = read_json(STATE_FILE) if STATE_FILE.is_file() else None
+    if not isinstance(previous, dict) or previous.get("schemaVersion") != SCHEMA:
+        previous = {}
+    stored = previous.get("files") if isinstance(previous.get("files"), dict) else {}
+
+    state_files = {path: FileState(raw) for path, raw in stored.items()}
+    log = SourceLog()
+
+    if force:
+        for state in state_files.values():
+            state.cached = False
+
+    scan_factory(state_files, force, log)
+    scan_agy(state_files, force, log)
+    scan_claude(state_files, force, log)
+    scan_codex(state_files, force, log)
+    scan_opencode(state_files, force, log)
+    scan_gemini(state_files, force, log)
+
+    covered = {
+        agent
+        for state in state_files.values()
+        for day in state.usage.values()
+        for agent in day
+        if any(any(counts) for counts in day[agent].values())
+    }
+    native = {agent for agent in covered if agent not in {"unknown"}}
+    scan_omarchy_records(state_files, force, log, native)
+
+    # A file that no longer exists keeps no rows.
+    for path in list(state_files):
+        if not Path(path).exists():
+            del state_files[path]
+
+    meta = {
+        "scanMs": int((time.perf_counter() - started) * 1000),
+        "mode": "cold" if force or not stored else "warm",
+        "sources": log.entries,
+        "files": len(state_files),
+        "pid": os.getpid(),
+    }
+    payload = build_payload(state_files, meta, history_days)
+    payload["meta"]["scanMs"] = int((time.perf_counter() - started) * 1000)
+
+    # Only files that still exist are worth storing.
+    write_json(STATE_FILE, {
+        "schemaVersion": SCHEMA,
+        "files": {path: state.to_json() for path, state in state_files.items() if Path(path).exists()},
+    })
+    write_json(CACHE_FILE, payload)
+    return payload
+
+
+def with_lock(force: bool, history_days: int) -> dict[str, Any]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "w", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Another monitor in another bar instance is scanning. Its result
+            # is this one's result, so wait briefly for the file to land.
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                time.sleep(0.04)
+                cached = read_json(CACHE_FILE)
+                if isinstance(cached, dict) and cached.get("schemaVersion") == SCHEMA:
+                    return cached
+            return read_json(CACHE_FILE) or {}
+        return scan(force, history_days)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=True, description="Local token usage and cost for coding agents.")
+    parser.add_argument("--json", action="store_true", help="print the payload (default)")
+    parser.add_argument("--refresh", action="store_true", help="rescan every file from the start")
+    parser.add_argument("--doctor", action="store_true", help="print per-source diagnostics")
+    parser.add_argument("--path", action="store_true", help="print the cache path")
+    parser.add_argument("--days", type=int, default=DEFAULT_HISTORY_DAYS, help="days of history to keep")
+    args = parser.parse_args(argv)
+
+    if args.path:
+        print(CACHE_FILE)
+        return 0
+
+    history_days = max(1, min(3650, int(args.days or DEFAULT_HISTORY_DAYS)))
+    payload = with_lock(args.refresh, history_days)
+
+    if args.doctor:
+        print(f"cache: {CACHE_FILE}")
+        print(f"state: {STATE_FILE}")
+        print(f"scan: {payload.get('meta', {}).get('scanMs', 0)} ms, {payload.get('meta', {}).get('mode', '?')}")
+        print(f"days: {len(payload.get('days') or [])}  agents: {len(payload.get('agents') or [])}")
+        for entry in payload.get("meta", {}).get("sources", []):
+            print(f"  {entry['id']:<10} {'ok' if entry['ok'] else '--'} files={entry['files']:<3} rows={entry['rows']:<6} {entry['note']}")
+        return 0
+
+    print(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

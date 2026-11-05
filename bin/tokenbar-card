@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Render a Tokenbar share card from the cached usage payload.
+
+Writes a 2400x1350 SVG in the current theme's colours, and a PNG beside it
+when rsvg-convert, inkscape, or ImageMagick is installed. The last line of
+stdout is the file that was written, which is what the panel shows.
+
+Usage:
+  tokenbar-card --from 2026-11-01 --to 2026-11-06 --out ~/Pictures/Tokenbar
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "tokenbar" / "usage.json"
+NARROW = 2400
+
+
+def load_payload(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"tokenbar-card: cannot read {path}: {error}")
+
+
+def summarize(payload: dict, start: str, end: str) -> dict:
+    ids = payload.get("agentIds") or []
+    names = payload.get("modelNames") or []
+    meta = {agent["id"]: agent for agent in payload.get("agents") or []}
+    total = {"cost": 0, "tokens": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+             "prompts": 0, "agents": {}, "models": {}}
+    for day in payload.get("days") or []:
+        if day.get("d", "") < start or day.get("d", "") > end:
+            continue
+        for row in day.get("r") or []:
+            agent = ids[row[0]] if 0 <= row[0] < len(ids) else "unknown"
+            model = names[row[1]] if 0 <= row[1] < len(names) else "unknown"
+            tokens = row[2] + row[3] + row[4] + row[5]
+            cost = row[6] or 0
+            entry = total["agents"].setdefault(agent, {"id": agent,
+                                                       "name": (meta.get(agent) or {}).get("name", agent),
+                                                       "cost": 0, "tokens": 0})
+            entry["cost"] += cost
+            entry["tokens"] += tokens
+            model_entry = total["models"].setdefault(model, {"n": model, "cost": 0, "tokens": 0})
+            model_entry["cost"] += cost
+            model_entry["tokens"] += tokens
+            total["cost"] += cost
+            total["tokens"] += tokens
+            total["input"] += row[2]
+            total["output"] += row[3]
+            total["cache_read"] += row[4]
+            total["cache_write"] += row[5]
+        for activity in day.get("a") or []:
+            total["prompts"] += activity[2] or 0
+    total["agents"] = sorted(total["agents"].values(), key=lambda item: (-item["cost"], -item["tokens"]))
+    total["models"] = sorted(total["models"].values(), key=lambda item: (-item["cost"], -item["tokens"]))
+    return total
+
+
+def money(nano: int) -> str:
+    dollars = (nano or 0) / 1_000_000_000
+    if dollars <= 0:
+        return "$0.00"
+    if dollars < 0.01:
+        return "<$0.01"
+    if dollars >= 1000:
+        return f"${dollars / 1000:.1f}k"
+    return f"${dollars:.2f}"
+
+
+def tokens(count: int) -> str:
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.1f}B"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M" if count < 10_000_000 else f"{count / 1_000_000:.0f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}k" if count < 10_000 else f"{count / 1_000:.0f}k"
+    return str(count)
+
+
+def clip(text: str, limit: int) -> str:
+    text = str(text or "")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def render(payload: dict, summary: dict, start: str, end: str, title: str,
+           fg: str, bg: str, accent: str) -> str:
+    width, height = NARROW, 1350
+    pad = 110
+    muted = 0.55
+    accent_soft = 0.35
+
+    def text(x, y, value, size, color=None, weight="normal", anchor="start", opacity=1.0):
+        return (
+            f'<text x="{x}" y="{y}" font-family="monospace" font-size="{size}" font-weight="{weight}" '
+            f'fill="{color or fg}" fill-opacity="{opacity}" text-anchor="{anchor}">{escape(str(value))}</text>'
+        )
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">',
+        f'<rect width="{width}" height="{height}" fill="{bg}"/>',
+        # Header
+        text(pad, pad + 34, "Tokenbar", 62, weight="bold"),
+        text(pad, pad + 92, f"{start} → {end}", 30, opacity=muted),
+        text(width - pad, pad + 34, "AI usage", 34, color=accent, anchor="end", opacity=0.9),
+        text(width - pad, pad + 92, "estimated from local logs", 26, anchor="end", opacity=muted),
+        # Hero
+        text(pad, 400, money(summary["cost"]), 168, weight="bold"),
+        text(pad, 470, f'{tokens(summary["tokens"])} tokens · {summary["prompts"]} prompts', 36, opacity=muted),
+    ]
+
+    # Agent rows, left column.
+    agents = summary["agents"][:6]
+    top = 610
+    parts.append(text(pad, top, "AGENTS", 26, opacity=muted, weight="bold"))
+    for index, agent in enumerate(agents):
+        y = top + 66 + index * 84
+        share = (agent["cost"] / summary["cost"]) if summary["cost"] else 0
+        parts.append(text(pad, y, clip(agent["name"], 22), 34))
+        parts.append(text(pad + 560, y, money(agent["cost"]), 34, anchor="end"))
+        parts.append(text(pad + 860, y, f'{tokens(agent["tokens"])} tok', 30, anchor="end", opacity=muted))
+        parts.append(f'<rect x="{pad}" y="{y + 18}" width="860" height="10" rx="5" fill="{fg}" fill-opacity="0.10"/>')
+        parts.append(f'<rect x="{pad}" y="{y + 18}" width="{max(4, int(860 * share))}" height="10" rx="5" '
+                     f'fill="{accent}" fill-opacity="{accent_soft + 0.5:.2f}"/>')
+
+    # Model rows, right column.
+    models = summary["models"][:8]
+    right = width // 2 + 90
+    parts.append(text(right, top, "MODELS", 26, opacity=muted, weight="bold"))
+    for index, model in enumerate(models):
+        y = top + 66 + index * 68
+        parts.append(text(right, y, clip(model["n"], 30), 30))
+        parts.append(text(width - pad, y, money(model["cost"]), 30, anchor="end"))
+        parts.append(text(width - pad - 250, y, tokens(model["tokens"]), 28, anchor="end", opacity=muted))
+
+    # Footer.
+    parts.append(f'<rect x="{pad}" y="{height - 150}" width="{width - pad * 2}" height="1" fill="{fg}" fill-opacity="0.14"/>')
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    parts.append(text(pad, height - 96, f"{title} · generated {generated}", 26, opacity=muted))
+    parts.append(text(width - pad, height - 96, "Tokenbar for Omarchy", 26, anchor="end", opacity=muted))
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def convert(svg: Path) -> Path | None:
+    png = svg.with_suffix(".png")
+    converters = [
+        (["rsvg-convert", "-w", "2400", "-h", "1350", "-o", str(png), str(svg)], png),
+        (["inkscape", str(svg), "--export-type=png", f"--export-filename={png}", "--export-width=2400"], png),
+        (["magick", str(svg), str(png)], png),
+        (["convert", str(svg), str(png)], png),
+    ]
+    for command, target in converters:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if target.is_file() and target.stat().st_size > 0:
+            return target
+    return None
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Render a Tokenbar share card.")
+    parser.add_argument("--from", dest="start", required=True)
+    parser.add_argument("--to", dest="end", required=True)
+    parser.add_argument("--out", default=str(Path.home() / "Pictures" / "Tokenbar"))
+    parser.add_argument("--input", default=str(CACHE))
+    parser.add_argument("--title", default="")
+    parser.add_argument("--fg", default="#cacccc")
+    parser.add_argument("--bg", default="#101315")
+    parser.add_argument("--accent", default="#cacccc")
+    args = parser.parse_args(argv)
+
+    if args.start > args.end:
+        args.start, args.end = args.end, args.start
+
+    payload = load_payload(Path(args.input))
+    summary = summarize(payload, args.start, args.end)
+    document = render(payload, summary, args.start, args.end, args.title or "All agents",
+                      args.fg, args.bg, args.accent)
+
+    directory = Path(os.path.expanduser(args.out))
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"tokenbar-{args.start}_{args.end}"
+    svg = directory / f"{stem}.svg"
+    svg.write_text(document, encoding="utf-8")
+    png = convert(svg)
+    print(png or svg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
