@@ -901,6 +901,10 @@ def build_payload(state_files: dict[str, FileState], meta: dict[str, Any], histo
     agent_index = {name: index for index, name in enumerate(agent_ids)}
 
     day_rows = []
+    # A session that runs over midnight is active on both days, but it is one
+    # session. Counting it on the day it first appears lets a range add up the
+    # per-day counts and still report distinct sessions.
+    seen_sessions: dict[str, set[str]] = {}
     for day in sorted(days):
         rows = []
         for agent in sorted(days[day]):
@@ -916,7 +920,13 @@ def build_payload(state_files: dict[str, FileState], meta: dict[str, Any], histo
                 ])
         act = []
         for agent, slot in sorted(activity.get(day, {}).items()):
-            act.append([agent_index.get(agent, -1), len(slot.get("sessions") or []), number(slot.get("prompts"))])
+            seen = seen_sessions.setdefault(agent, set())
+            started = 0
+            for session in slot.get("sessions") or []:
+                if session and session not in seen:
+                    seen.add(session)
+                    started += 1
+            act.append([agent_index.get(agent, -1), started, number(slot.get("prompts"))])
         if rows or act:
             day_rows.append({"d": day, "r": rows, "a": act})
 

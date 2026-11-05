@@ -20,9 +20,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import datetime as dt
 from pathlib import Path
 
 SCANNER = Path(__file__).resolve().parent.parent / "bin" / "tokenbar-scan"
+
+
+def local_stamp(year: int, month: int, day: int, hour: int, minute: int = 0) -> str:
+    """A UTC timestamp for a wall-clock time in the machine's own zone.
+
+    The scanner buckets by local day, so a test that means "just before
+    midnight" has to say it in local time rather than in UTC.
+    """
+    moment = dt.datetime(year, month, day, hour, minute).astimezone(dt.timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def droid_log_line(stamp: str, session: str, model: str, tokens: tuple[int, int, int, int]) -> str:
@@ -315,6 +326,23 @@ class ScannerTest(unittest.TestCase):
         )
         payload = self.run_scan("--refresh", "--days", "30")
         self.assertEqual(self.totals(payload, "factory"), 6)
+
+    def test_a_session_spanning_midnight_is_counted_once(self) -> None:
+        log = self.factories() / "logs" / "droid-log-single.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            droid_log_line(local_stamp(2026, 11, 4, 23, 50), "late", "gpt-6.1-sol", (10, 1, 0, 0)) + "\n"
+            + droid_log_line(local_stamp(2026, 11, 5, 0, 10), "late", "gpt-6.1-sol", (20, 2, 0, 0)) + "\n"
+            + droid_log_line(local_stamp(2026, 11, 5, 9, 0), "next", "gpt-6.1-sol", (30, 3, 0, 0)) + "\n",
+            encoding="utf-8",
+        )
+        payload = self.run_scan("--refresh")
+        # The agent still reports the session once overall, and the per-day
+        # counts add up to that same number.
+        self.assertEqual(self.agent(payload, "factory")["sessions"], 2)
+        per_day = sum(row[1] for day in payload["days"] for row in day["a"])
+        self.assertEqual(per_day, 2)
+        self.assertEqual([row[1] for day in payload["days"] for row in day["a"]], [1, 1])
 
     def test_payload_is_stable_across_repeated_scans(self) -> None:
         log = self.factories() / "logs" / "droid-log-single.log"
